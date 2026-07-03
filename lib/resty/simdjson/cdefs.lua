@@ -76,6 +76,18 @@ void simdjson_ffi_state_free(simdjson_ffi_state *state);
 int simdjson_ffi_is_eof(simdjson_ffi_state *state);
 int simdjson_ffi_parse(simdjson_ffi_state *state, const char *json, size_t len, char **errmsg);
 int simdjson_ffi_next(simdjson_ffi_state *state, char **errmsg);
+int simdjson_ffi_iterate(simdjson_ffi_state *state,
+                         const char *json, size_t len, char **errmsg);
+int simdjson_ffi_at_pointer(simdjson_ffi_state *state,
+                            const char *pointer, size_t plen, char **errmsg);
+int simdjson_ffi_get_pointer(simdjson_ffi_state *state,
+                             const char *json, size_t len,
+                             const char *pointer, size_t plen, char **errmsg);
+int simdjson_ffi_find_index(simdjson_ffi_state *state,
+                            const char *array_pointer, size_t aplen,
+                            const char *field, size_t flen,
+                            const char *value, size_t vlen,
+                            char **errmsg);
 ]])
 
 
