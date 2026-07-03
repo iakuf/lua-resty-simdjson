@@ -14,6 +14,12 @@ The fastest way to decode JSON in OpenResty for latency sensitive applications.
     * [simdjson.encode\_helper](#simdjsonencode_helper)
     * [simdjson.encode\_number\_precision](#simdjsonencode_number_precision)
     * [simdjson.encode\_sparse\_array](#simdjsonencode_sparse_array)
+* [Path-based extraction (gjson-style)](#path-based-extraction-gjson-style)
+    * [gjson.new](#gjsonnew)
+    * [gjson:get](#gjsonget)
+    * [gjson:get\_many](#gjsonget_many)
+    * [Path syntax](#path-syntax)
+    * [Low-level FFI primitives](#low-level-ffi-primitives)
 * [Performance characteristics](#performance-characteristics)
     * [Speed & Latency](#speed--latency)
     * [Memory](#memory)
@@ -164,6 +170,152 @@ never a JSON object.
 
 [Back to TOC](#table-of-contents)
 
+# Path-based extraction (gjson-style)
+
+`resty.simdjson.gjson` provides a **single-entry, path-based** value extractor
+built on top of simdjson's On-Demand API, similar in spirit to Go's
+[gjson](https://github.com/tidwall/gjson).
+
+Instead of decoding the **whole** document into a Lua table (which allocates a
+large table and stresses the GC), it **lazily walks** the document, materializing
+**only the value at the requested path**. Subtrees that are not on the path are
+skipped without being converted to Lua objects. This is ideal for pulling a few
+fields out of a large JSON body (e.g. extracting routing keys from a multi-MB
+LLM request payload).
+
+```lua
+local gjson = require("resty.simdjson.gjson")
+
+local g = gjson.new()  -- gjson.new(true) for a yieldable instance
+
+local body = [[
+{
+  "model": "gpt-4o",
+  "prompt_cache_key": "sess-abc",
+  "messages": [
+    {"role": "user",   "content": "hi there"},
+    {"role": "system", "content": "you are a helpful assistant"}
+  ]
+}
+]]
+
+g:get(body, "model")                                -- "gpt-4o"
+g:get(body, "prompt_cache_key")                     -- "sess-abc"
+g:get(body, "messages.0.role")                      -- "user"
+g:get(body, "messages.#(role==system).content")     -- "you are a helpful assistant"
+g:get(body, "nonexistent")                          -- nil (not found, no error)
+
+g:destroy()  -- optional; also freed on GC
+```
+
+## gjson.new
+
+**syntax:** *g = gjson.new(yield?)*
+
+Create a new extractor instance. If `yield` is `true`, materializing large
+object/array subtrees yields periodically to reduce latency impact on the Nginx
+event loop. Default is `false`.
+
+**Safety:** Same as `simdjson.new` — an instance is **not** reentrant. Do not use
+the same instance from concurrent requests. Creating one instance per request is
+cheap and safe.
+
+[Back to TOC](#table-of-contents)
+
+## gjson:get
+
+**syntax:** *value, err = g:get(json, path)*
+
+Extract the value at `path` from the `json` string.
+
+* On a hit, returns the value as a native Lua value: string, number, boolean,
+  `ngx.null` (for JSON `null`), or a Lua table (for an object/array subtree).
+* If the path does not exist (missing key, out-of-range index, or a predicate
+  with no match), returns `nil` **with no error** — this lets you treat "absent"
+  and "present" uniformly.
+* On a malformed-JSON or internal error, returns `nil, err`.
+
+Internally this performs a single `iterate` (one stage-1 SIMD scan) and then
+walks the path, resolving array predicates via a C-side scan. Only the final
+hit is materialized.
+
+[Back to TOC](#table-of-contents)
+
+## gjson:get\_many
+
+**syntax:** *tbl, err = g:get_many(json, paths)*
+
+Extract multiple paths. `paths` is an array of path strings. Returns a table
+mapping each **found** path to its value (missing paths are omitted).
+
+```lua
+local vals = g:get_many(body, {
+  "model",
+  "prompt_cache_key",
+  "messages.#(role==system).content",
+})
+-- vals["model"], vals["prompt_cache_key"], ...
+```
+
+> Note: the current implementation evaluates each path independently (each does
+> its own forward positioning after an automatic rewind). For a handful of
+> front-loaded fields this is very fast. A single-pass multi-path optimization
+> can be added later if profiling shows repeated positioning is a bottleneck.
+
+[Back to TOC](#table-of-contents)
+
+## Path syntax
+
+A compact subset of the gjson path language:
+
+| Syntax | Meaning | Example |
+|---|---|---|
+| `a.b.c` | nested object keys | `metadata.user_id` |
+| `a.N` | array element by index (0-based) | `messages.0.role` |
+| `a.#(k==v)` | first array element whose string field `k` equals `v` | `messages.#(role==system)` |
+| `a.#(k==v).sub` | drill further after a predicate match | `messages.#(role==system).content` |
+
+Predicates can be chained, which is handy for multi-modal `content` arrays:
+
+```lua
+-- pick the first text block of the system message, skipping media parts
+g:get(body, "messages.#(role==system).content.#(type==text).text")
+```
+
+**Supported:** `.` nesting, `.N` indexing, `#(field==value)` string-equality
+predicate (and chaining/drilling after it).
+**Not supported (yet):** wildcards `*`, array-length `#`, multi-select `#(...)#`,
+and non-string predicate comparisons.
+
+Keys containing `.` are not expressible in this compact syntax; use the
+low-level FFI `at_pointer` (RFC 6901 JSON Pointer, with `~1` escaping) directly
+if you need that.
+
+[Back to TOC](#table-of-contents)
+
+## Low-level FFI primitives
+
+The path engine is built on four C functions exported from
+`libsimdjson_ffi.so` (declared in `resty/simdjson/cdefs.lua`). You can call them
+directly for custom traversals:
+
+| Function | Purpose |
+|---|---|
+| `simdjson_ffi_iterate(state, json, len, errmsg)` | One stage-1 SIMD scan; builds the document, emits no opcodes. Returns `0` / `-1`. |
+| `simdjson_ffi_at_pointer(state, ptr, plen, errmsg)` | On an already-iterated document, resolve an RFC 6901 JSON Pointer. Auto-rewinds, so it can be called repeatedly. Returns opcode count, `-2` (not found), or `-1` (error). |
+| `simdjson_ffi_get_pointer(state, json, len, ptr, plen, errmsg)` | Convenience: `iterate` + `at_pointer` in one call, for a single lookup. |
+| `simdjson_ffi_find_index(state, arr_ptr, aplen, field, flen, value, vlen, errmsg)` | On an array at `arr_ptr`, return the index of the first element whose string field `field` equals `value`. `-2` if none. |
+
+These are generic JSON primitives and carry no business logic. All values
+(field names, expected values) are supplied by the caller.
+
+**Lifetime constraint:** after `iterate`, the document may reference the input
+`json` buffer directly (zero-copy). Keep a Lua reference to `json` alive until
+all `at_pointer` / `find_index` calls for that document have completed. The
+`gjson` module already satisfies this within each `get`.
+
+[Back to TOC](#table-of-contents)
+
 # Performance characteristics
 
 ## Speed & Latency
@@ -207,6 +359,10 @@ Requests/sec:   1999.86
 Transfer/sec:    330.05KB
 ```
 
+For path-based extraction, pulling 3 front-loaded fields out of a ~550KB payload
+was measured at roughly **6x** faster than a full `cjson.decode`, while producing
+almost no intermediate Lua tables.
+
 [Back to TOC](#table-of-contents)
 
 ## Memory
@@ -217,6 +373,10 @@ and can be freed immediately after the call of `:decode()` or `:destroy()`.
 Encode will use less memory than lua-cjson if you use the streaming method
 with [`:encode_helper`](#simdjsonencode_helper), or approximately same amount of memory with
 [`:encode`](#simdjsonencode).
+
+Path-based extraction with [`gjson:get`](#gjsonget) materializes only the value
+at the requested path, so extracting a few fields from a large document uses far
+less memory than decoding the whole thing.
 
 [Back to TOC](#table-of-contents)
 
