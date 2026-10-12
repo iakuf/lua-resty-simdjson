@@ -412,9 +412,9 @@ parent (`metadata` for `metadata.user_id`).
   The top-level fields read by the caller are still exact, because string
   boundaries and UTF-8 come from stage 1 and the top level is strict.
 
-The default was chosen by measurement (strict costs up to 2.6x shallow on
-escape-dense bodies, above the 2.0x budget); `validate = "strict"` is a per-call
-switch.
+The default was chosen by measurement: strict costs 1.9-2.8x shallow on 8-50 MB
+escape-dense bodies, above the 2.0x budget in 10 of 12 cells over two runs.
+`validate = "strict"` is a per-call switch.
 
 [Back to TOC](#table-of-contents)
 
@@ -428,8 +428,11 @@ switch.
 | `max_extract_bytes` (sum of all hits, repeats included; never truncated) | 65536 | 16 MiB | `limit_extract` |
 | input length | | 4294967295 | `limit_input` |
 
-Above a hard cap, or bad paths/types: `bad_args`. Limits fail at the point
-they are reached; the error reported is the first one in document order.
+Above a hard cap, or bad paths/types: `bad_args`. Stage 1 runs over the whole
+input before the walk, so a stage-1 error (invalid UTF-8, a raw control
+character or an unclosed string, wherever it is) is reported first; otherwise
+the walk stops at the first error in document order, limits included (a limit
+fails at the point it is reached).
 
 | err | C status | when |
 | --- | ---: | --- |
@@ -477,32 +480,33 @@ the Lua default is shallow.
   messages, ~190 MiB for 50 MB of `[0,0,0,...]` (the same as `gjson:get_many`).
   File mode additionally maps the page-cache pages of the body (RssFile).
 * **String input** is used in place when the 64 bytes after its end lie in the
-  same page; otherwise it is copied once with padding (`copied_bytes`).
+  same page; otherwise it is copied once with padding (`copied_bytes`). This
+  is the same `get_padded_string_view()` decision the existing `parse`,
+  `iterate` and `get_pointer` use.
   **File input** is never copied: a `PROT_READ` anonymous reservation of
   `roundup(size + 64, page)` bytes with the file mapped over its start
   (`MAP_FIXED`), so the padding always reads as zeros.
 * **SIGBUS:** truncating the file while it is being scanned faults the worker.
   Only pass files nobody else writes (Nginx's own request-body temp files).
 * **Blocking:** one FFI call, it cannot yield. Measured on an i5-12490F,
-  release build, `apache/apisix:3.15.0-debian` (`timing.total_ns`, median of 5):
+  release build, `apache/apisix:3.15.0-debian` (`timing.total_ns` for root
+  scan, wall clock for the others; median of 5 samples, range over two runs):
 
   | 50 MB body | shallow (default) | strict | `gjson:get_many` (3 fields) | `cjson.safe.decode` |
   | --- | ---: | ---: | ---: | ---: |
-  | base64 image | 5.5 ms | 8.7 ms | 14 ms | 101 ms |
-  | chat messages | 18 ms | 28 ms | 24 ms | 283 ms |
-  | escape-dense text | 11 ms | 29 ms | 21 ms | 98 ms |
-  | `[0,0,...]` | 126 ms | 261 ms | 164 ms | 545 ms |
+  | base64 image | 4.7-5.5 ms | 8.7-11 ms | 14-16 ms | 98-101 ms |
+  | chat messages | 17.5-18.5 ms | 27-28 ms | 24 ms | 283-292 ms |
+  | escape-dense text | 10-11 ms | 28-29 ms | 20-21 ms | 98 ms |
+  | `[0,0,...]` | 126-151 ms | 255-261 ms | 164-169 ms | 528-545 ms |
 
   Scaling is linear; budget concurrency for the worst shape.
-* **Existing `parse` / `iterate` / `get_pointer` padding check:**
-  `need_allocation()` copies only when the input ends in the *first* 64 bytes
-  of a page, so an input that ends near the *end* of a page is read in place
-  and can be over-read; a guard-page probe on `simdjson_ffi_get_pointer`
-  crashes (SIGSEGV) when the input ends 0-16 bytes before an unmapped page
-  (document ending in a string value; 0 bytes for one ending in a number).
-  Root scan uses its own
-  correct check and is tested with a guard page at 0..80 bytes. The existing
-  function is left unchanged in this branch.
+* **Padding check:** `need_allocation()` copies when the input's last byte
+  plus `SIMDJSON_PADDING` would reach the next page (the simdjson
+  free-padding rule). Earlier versions compared the page offset with
+  `SIMDJSON_PADDING` the other way round and could read past an input that
+  ends near the end of a page; `t/10-padding-boundary.t` covers that case for
+  `iterate` / `get_pointer` / `parse`, and the root-scan specs place string
+  inputs 0..80 bytes before a guard page.
 
 [Back to TOC](#table-of-contents)
 
