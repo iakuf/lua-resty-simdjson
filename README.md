@@ -497,8 +497,10 @@ the Lua default is shallow.
 * **Existing `parse` / `iterate` / `get_pointer` padding check:**
   `need_allocation()` copies only when the input ends in the *first* 64 bytes
   of a page, so an input that ends near the *end* of a page is read in place
-  and can be over-read; a guard-page probe crashes it (SIGSEGV) when a string
-  body ends within 16 bytes of an unmapped page. Root scan uses its own
+  and can be over-read; a guard-page probe on `simdjson_ffi_get_pointer`
+  crashes (SIGSEGV) when the input ends 0-16 bytes before an unmapped page
+  (document ending in a string value; 0 bytes for one ending in a number).
+  Root scan uses its own
   correct check and is tested with a guard page at 0..80 bytes. The existing
   function is left unchanged in this branch.
 
