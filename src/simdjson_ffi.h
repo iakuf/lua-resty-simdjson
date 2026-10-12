@@ -105,4 +105,146 @@ struct simdjson_ffi_state_t {
 typedef struct simdjson_ffi_state_t simdjson_ffi_state;
 
 
+// ===========================================================================
+// Root scan (ABI version 1): one stage-1 pass over a JSON object body that
+// returns every top-level member (decoded key + byte offsets) and the bounded
+// raw bytes of caller-selected top-level / second-level fields.
+//
+// Purely additive: nothing above this block changes. Offsets are 0-based
+// byte offsets into the input, ranges are [start, end). See README
+// "Root scan (top-level member index)".
+// ===========================================================================
+
+extern "C" {
+    typedef enum {
+        SIMDJSON_FFI_RS_OK                  = 0,
+        SIMDJSON_FFI_RS_DUPLICATE_KEY       = 1,   /* non-fatal: fully validated, index complete */
+        SIMDJSON_FFI_RS_ERR_SYNTAX          = -10,
+        SIMDJSON_FFI_RS_ERR_ROOT_NOT_OBJECT = -11,
+        SIMDJSON_FFI_RS_ERR_TRAILING        = -12,
+        SIMDJSON_FFI_RS_ERR_LIMIT_DEPTH     = -20,
+        SIMDJSON_FFI_RS_ERR_LIMIT_MEMBERS   = -21,
+        SIMDJSON_FFI_RS_ERR_LIMIT_KEY       = -22,
+        SIMDJSON_FFI_RS_ERR_LIMIT_EXTRACT   = -23,
+        SIMDJSON_FFI_RS_ERR_LIMIT_INPUT     = -24,
+        SIMDJSON_FFI_RS_ERR_IO              = -30,
+        SIMDJSON_FFI_RS_ERR_NOMEM           = -40,
+        SIMDJSON_FFI_RS_ERR_BAD_ARGS        = -41,
+        SIMDJSON_FFI_RS_ERR_INTERNAL        = -42
+    } simdjson_ffi_rs_status_e;
+
+    typedef enum {
+        SIMDJSON_FFI_RS_T_OBJECT = 1,
+        SIMDJSON_FFI_RS_T_ARRAY,
+        SIMDJSON_FFI_RS_T_STRING,
+        SIMDJSON_FFI_RS_T_NUMBER,
+        SIMDJSON_FFI_RS_T_BOOLEAN,
+        SIMDJSON_FFI_RS_T_NULL
+    } simdjson_ffi_rs_type_e;
+
+    typedef enum {
+        SIMDJSON_FFI_RS_F_SHALLOW    = 1,   /* scheme B: only the top level is strictly validated */
+        SIMDJSON_FFI_RS_F_FORCE_COPY = 2    /* tests: string input always takes the padded-copy path */
+    } simdjson_ffi_rs_flag_e;
+
+    typedef enum {
+        SIMDJSON_FFI_RS_M_DUPLICATE = 1,
+        SIMDJSON_FFI_RS_M_FOUND     = 2
+    } simdjson_ffi_rs_mark_e;
+
+    /* depth = 1: top-level key seg[0]; depth = 2: direct child seg[1] of top-level object seg[0] */
+    typedef struct {
+        const char  *seg[2];
+        uint32_t     seg_len[2];
+        uint32_t     depth;
+        uint32_t     reserved;
+    } simdjson_ffi_rs_path_t;
+
+    /* every limit: 0 = default */
+    typedef struct {
+        uint32_t                       max_depth;
+        uint32_t                       max_members;
+        uint32_t                       max_key_bytes;
+        uint32_t                       max_extract_bytes;
+        uint32_t                       flags;
+        uint32_t                       path_count;
+        const simdjson_ffi_rs_path_t  *paths;
+    } simdjson_ffi_rs_options_t;
+
+    /* key_start/key_end include the quotes; key_off/key_len index the decoded key in result->keys */
+    typedef struct {
+        uint64_t     key_start;
+        uint64_t     key_end;
+        uint64_t     value_start;
+        uint64_t     value_end;
+        uint32_t     key_off;
+        uint32_t     key_len;
+        uint32_t     type;
+        uint32_t     flags;
+    } simdjson_ffi_rs_member_t;
+
+    /* one entry per options->paths[i]; raw_off/raw_len index result->extract */
+    typedef struct {
+        uint64_t     value_start;
+        uint64_t     value_end;
+        uint32_t     raw_off;
+        uint32_t     raw_len;
+        uint32_t     type;
+        uint32_t     flags;
+    } simdjson_ffi_rs_value_t;
+
+    typedef struct {
+        int32_t                           status;
+        int32_t                           sys_errno;
+        const char                       *message;       /* static string, never input bytes */
+        int64_t                           error_offset;  /* -1 = unknown */
+        uint64_t                          input_len;
+        uint64_t                          copied_bytes;
+        uint64_t                          root_start;
+        uint64_t                          root_end;
+        uint32_t                          member_count;
+        uint32_t                          path_count;
+        uint32_t                          duplicate_count;
+        uint32_t                          max_depth_seen;
+        const simdjson_ffi_rs_member_t   *members;
+        const simdjson_ffi_rs_value_t    *values;
+        const char                       *keys;
+        const char                       *extract;
+        uint64_t                          t_input_ns;
+        uint64_t                          t_index_ns;
+        uint64_t                          t_walk_ns;
+        uint64_t                          t_total_ns;
+        void                             *opaque;
+    } simdjson_ffi_rs_result_t;
+
+    /* returns the ABI version (1); writes up to n struct sizes:
+       path, options, member, value, result */
+    uint32_t simdjson_ffi_root_scan_abi(uint32_t *sizes, uint32_t n);
+
+    /* both return result->status; *out is NULL only if out == NULL or the result
+       itself could not be allocated (NOMEM). Otherwise the caller must free *out. */
+    int simdjson_ffi_root_scan_string(const char *buf, size_t len,
+                                      const simdjson_ffi_rs_options_t *opts,
+                                      simdjson_ffi_rs_result_t **out);
+    int simdjson_ffi_root_scan_file(const char *path, size_t path_len,
+                                    const simdjson_ffi_rs_options_t *opts,
+                                    simdjson_ffi_rs_result_t **out);
+
+    /* NULL-safe */
+    void simdjson_ffi_root_scan_free(simdjson_ffi_rs_result_t *res);
+}
+
+
+static_assert(sizeof(simdjson_ffi_rs_path_t) == 32,
+              "simdjson_ffi_rs_path_t should be 32 bytes");
+static_assert(sizeof(simdjson_ffi_rs_options_t) == 32,
+              "simdjson_ffi_rs_options_t should be 32 bytes");
+static_assert(sizeof(simdjson_ffi_rs_member_t) == 48,
+              "simdjson_ffi_rs_member_t should be 48 bytes");
+static_assert(sizeof(simdjson_ffi_rs_value_t) == 32,
+              "simdjson_ffi_rs_value_t should be 32 bytes");
+static_assert(sizeof(simdjson_ffi_rs_result_t) == 144,
+              "simdjson_ffi_rs_result_t should be 144 bytes");
+
+
 #endif /* !SIMDJSON_FFI_H */
