@@ -534,8 +534,8 @@ int simdjson_ffi_find_index(simdjson_ffi_state *state,
 //
 // One call = one local ondemand::parser = one stage-1 pass. Stage 1 already
 // validates UTF-8, unescaped control characters and string closure for the
-// whole input. Strict mode (scheme A, the default) then walks every value with
-// the On-Demand iterator, which rejects missing commas/colons, trailing commas,
+// whole input. Strict mode (scheme A) then walks every value with the
+// On-Demand iterator, which rejects missing commas/colons, trailing commas,
 // non-string keys and bracket mismatches, and checks without writing the
 // parser's string buffer:
 //   * string values and nested keys: escapes on the raw bytes (rs_string_body)
@@ -543,7 +543,9 @@ int simdjson_ffi_find_index(simdjson_ffi_state *state,
 //   * true / false / null: simdjson get_bool() / is_null()
 // Shallow mode (scheme B, SIMDJSON_FFI_RS_F_SHALLOW) validates only the top
 // level and skips nested containers by bracket counting (raw_json()).
-// No state survives a call except the read-only page-size cache.
+// Defaults: at this C level flags = 0 means strict; the Lua wrapper
+// (lib/resty/simdjson/root_scan.lua) defaults to shallow and sets the flag.
+// No state survives a call except the read-only page-size caches.
 // ===========================================================================
 
 #include <cerrno>
@@ -614,14 +616,6 @@ inline size_t rs_rtrim(const uint8_t *p, size_t n) {
         n--;
     }
     return n;
-}
-
-
-// Free-padding rule from simdjson doc/performance.md: reading SIMDJSON_PADDING
-// bytes past the last byte must stay inside the page that holds the last byte.
-inline bool rs_need_copy(const char *buf, size_t len) {
-    uintptr_t page = uintptr_t(rs_page());
-    return (reinterpret_cast<uintptr_t>(buf + len - 1) % page) + SIMDJSON_PADDING >= page;
 }
 
 
@@ -1646,17 +1640,26 @@ int rs_from_string(const char *buf, size_t len, const simdjson_ffi_rs_options_t 
         return rs_set(r, SIMDJSON_FFI_RS_ERR_LIMIT_INPUT, "input above 4294967295 bytes", -1);
     }
 
+    // Same copy decision as parse/iterate/get_pointer: get_padded_string_view()
+    // (need_allocation(), fixed in 2722c49) copies only when the SIMDJSON_PADDING
+    // bytes after the input would cross into the next page. F_FORCE_COPY (tests)
+    // always copies.
     padded_string copy;
-    const uint8_t *base = reinterpret_cast<const uint8_t *>(buf);
+    const char *data;
 
-    if ((cfg.flags & SIMDJSON_FFI_RS_F_FORCE_COPY) || rs_need_copy(buf, len)) {
+    if (cfg.flags & SIMDJSON_FFI_RS_F_FORCE_COPY) {
         copy = padded_string(buf, len);
-        if (copy.data() == nullptr) {
-            return rs_set(r, SIMDJSON_FFI_RS_ERR_NOMEM, "out of memory", -1);
-        }
-        base = reinterpret_cast<const uint8_t *>(copy.data());
+        data = copy.data();
+    } else {
+        data = get_padded_string_view(buf, len, copy).data();
+    }
+    if (data == nullptr) {      // the padded copy could not be allocated
+        return rs_set(r, SIMDJSON_FFI_RS_ERR_NOMEM, "out of memory", -1);
+    }
+    if (data != buf) {
         r.pub.copied_bytes = len;
     }
+    const uint8_t *base = reinterpret_cast<const uint8_t *>(data);
 
     r.pub.t_input_ns = rs_now_ns() - t0;
 
