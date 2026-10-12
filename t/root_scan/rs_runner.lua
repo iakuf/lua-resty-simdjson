@@ -11,8 +11,19 @@ T.__index = T
 local MAX_FAILS_PRINTED = 50
 
 
+-- Light mode: under valgrind (TEST_NGINX_USE_VALGRIND, as set by the CI
+-- valgrind job; t/11-root-scan.t passes it to the workers with `env`) or with
+-- --light. Specs then skip their large inputs and drop the timing, RSS and
+-- heap assertions, which would measure the instrumented process rather than
+-- the library; every functional assertion still runs.
+local function env_light()
+    local v = os.getenv("TEST_NGINX_USE_VALGRIND")
+    return v ~= nil and v ~= "" and v ~= "0"
+end
+
+
 function R.parse_args(argv)
-    local a = { specs = {}, fuzz_n = 2000, seed = 20261012, heavy = false }
+    local a = { specs = {}, fuzz_n = 2000, seed = 20261012, heavy = false, light = env_light() }
     for i = 1, #argv do
         local v = argv[i]
         local k, val = v:match("^%-%-([%w_-]+)=(.*)$")
@@ -22,11 +33,17 @@ function R.parse_args(argv)
             a.seed = tonumber(val)
         elseif v == "--heavy" then
             a.heavy = true
+        elseif v == "--light" then
+            a.light = true
         elseif v:sub(1, 2) == "--" then
             error("unknown option " .. v)
         else
             a.specs[#a.specs + 1] = v
         end
+    end
+    if a.light then
+        a.heavy = false
+        a.fuzz_n = math.min(a.fuzz_n, 100)
     end
     return a
 end

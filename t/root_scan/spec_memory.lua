@@ -2,6 +2,8 @@
 -- scans; RSS growth between scan 100 and the end <= 2 MiB, Lua heap growth
 -- after full GC <= 64 KiB. Mixed sizes report residual RSS (not a gate).
 -- --heavy: 50 MB base64 body in string and file mode (timing, peak, heap).
+-- Light mode (valgrind): a few scans per path, no RSS/heap/timing assertions;
+-- leak detection is then valgrind's job.
 
 local rs = require("resty.simdjson.root_scan")
 local U  = require("rs_util")
@@ -19,7 +21,13 @@ local function body(bytes)
     return head .. s .. tail
 end
 
-local function loop(t, label, n, fn)
+local function loop(t, label, n, fn, light)
+    if light then
+        for i = 1, n do
+            t:ok(fn() ~= nil, label .. ": scan " .. i)
+        end
+        return
+    end
     local rss100, lua100
     for i = 1, n do
         local idx = fn()
@@ -79,14 +87,23 @@ return function(t, args)
     local path = U.tmp("mem.json")
     U.write_file(path, json)
 
-    loop(t, "1 MB string x2000", 2000, function() return rs.scan_string(json, { paths = PATHS }) end)
-    loop(t, "1 MB file x200", 200, function() return rs.scan_file(path, { paths = PATHS }) end)
+    local light = args.light
+    local ns, nf = 2000, 200
+    if light then ns, nf = 20, 10 end
+
+    loop(t, "1 MB string x" .. ns, ns, function() return rs.scan_string(json, { paths = PATHS }) end, light)
+    loop(t, "1 MB file x" .. nf, nf, function() return rs.scan_file(path, { paths = PATHS }) end, light)
     local trailing = json .. "x"
-    loop(t, "1 MB error path x2000", 2000, function()
+    loop(t, "1 MB error path x" .. ns, ns, function()
         local _, err = rs.scan_string(trailing, { paths = PATHS })
         return err == "trailing_content" and true or nil
-    end)
+    end, light)
     trailing = nil
+
+    if light then
+        os.remove(path)
+        return
+    end
 
     -- residual RSS after a mix of sizes (informational)
     collectgarbage()
@@ -95,7 +112,7 @@ return function(t, args)
         local j = body(sz)
         local idx = rs.scan_string(j, { paths = PATHS })
         t:ok(idx ~= nil, "mixed size " .. sz)
-        j = nil
+        j = nil  -- luacheck: ignore 311
         collectgarbage()
     end
     collectgarbage()

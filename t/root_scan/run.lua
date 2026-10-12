@@ -1,4 +1,6 @@
--- resty t/root_scan/run.lua <spec...> [--fuzz-n=N] [--seed=S] [--heavy]
+-- resty t/root_scan/run.lua <spec...> [--fuzz-n=N] [--seed=S] [--heavy] [--light]
+-- --light (also implied by TEST_NGINX_USE_VALGRIND): small inputs, no
+-- timing/RSS/heap assertions, fuzz capped at 100 documents.
 -- Run from the repository root; every spec should run in its own process
 -- (rs-test.sh does that) so memory numbers do not leak between specs.
 

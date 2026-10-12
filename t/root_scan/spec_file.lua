@@ -71,7 +71,7 @@ return function(t)
 
     -- I/O errors
     U.write_file(path, "")
-    local _, err, d = rs.scan_file(path)
+    local _, err = rs.scan_file(path)
     t:eq(err, "syntax", "empty file")
     U.write_file(path, "  \n ")
     _, err = rs.scan_file(path)
@@ -80,6 +80,7 @@ return function(t)
     _, err = rs.scan_file(path)
     t:eq(err, "root_not_object", "array file")
     os.remove(path)
+    local d
     _, err, d = rs.scan_file(path)
     t:eq(err, "io", "missing file")
     t:eq(d and d.errno, 2, "ENOENT")

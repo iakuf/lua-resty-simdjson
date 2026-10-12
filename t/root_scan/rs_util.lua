@@ -79,6 +79,14 @@ end
 -- Oracle: compare an index against lua-cjson on the same document
 -- --------------------------------------------------------------------------
 
+local JSON_WS = { [9] = true, [10] = true, [13] = true, [32] = true }
+
+-- non-empty and neither first nor last byte is JSON whitespace
+local function tight(s)
+    return #s > 0 and not JSON_WS[s:byte(1)] and not JSON_WS[s:byte(-1)]
+end
+
+
 -- Checks member order/offsets against the text and cjson. Returns true if all
 -- checks passed. `doc` is the cjson decode of `json` (optional).
 function U.check_index(t, json, idx, label, doc)
@@ -96,8 +104,12 @@ function U.check_index(t, json, idx, label, doc)
                   tag .. ": offsets ordered " .. R.show(m)) and ok
         prev_end = m.value_end
         local ktext = json:sub(m.key_start + 1, m.key_end)
+        -- exact bounds: cjson.decode tolerates surrounding whitespace, so check them directly
+        ok = t:ok(#ktext >= 2 and ktext:sub(1, 1) == '"' and ktext:sub(-1) == '"',
+                  tag .. ": key slice starts and ends with a quote " .. R.show(ktext)) and ok
         ok = t:eq(cjson.decode(ktext), m.key, tag .. ": key text decodes to key") and ok
         local vtext = json:sub(m.value_start + 1, m.value_end)
+        ok = t:ok(tight(vtext), tag .. ": value slice has no surrounding whitespace " .. R.show(vtext)) and ok
         local v = cjson.decode(vtext)
         if not m.duplicate then
             ok = t:deq(v, doc[m.key], tag .. ": value slice equals cjson") and ok
@@ -118,6 +130,12 @@ function U.check_index(t, json, idx, label, doc)
     local ncj = 0
     for _ in pairs(doc) do ncj = ncj + 1 end
     ok = t:eq(count, ncj, label .. ": distinct key count equals cjson") and ok
+    -- extracted values: raw is exactly the [value_start, value_end) slice
+    for p, v in pairs(idx.values or {}) do
+        local s = json:sub(v.value_start + 1, v.value_end)
+        ok = t:ok(v.raw == s and tight(s), label .. " values[" .. p .. "]: raw equals its tight slice "
+                  .. R.show(s)) and ok
+    end
     return ok
 end
 

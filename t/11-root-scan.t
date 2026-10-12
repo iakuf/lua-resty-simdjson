@@ -14,6 +14,15 @@ our $HttpConfig = qq{
     lua_package_cpath "$pwd/?.so;;";
 };
 
+# Pass TEST_NGINX_USE_VALGRIND through to the workers: rs_runner then runs the
+# specs in light mode (no large inputs, no timing/RSS/heap assertions).
+add_block_preprocessor(sub {
+    my $block = shift;
+    if (!defined $block->main_config) {
+        $block->set_value("main_config", "env TEST_NGINX_USE_VALGRIND;");
+    }
+});
+
 no_long_string();
 no_diff();
 

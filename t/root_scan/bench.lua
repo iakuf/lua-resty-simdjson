@@ -135,6 +135,5 @@ for rep = 1, reps do
         rec.model_ok = res and res.model == "gpt-4o"
     end
     print(cj.encode(rec))
-    res = nil
 end
 if path then os.remove(path) end

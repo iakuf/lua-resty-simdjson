@@ -23,7 +23,8 @@ local function nest(n)
     return '{"a":' .. string.rep("[", n - 1) .. string.rep("]", n - 1) .. "}"
 end
 
-return function(t)
+return function(t, args)
+    local light = args and args.light
     -- depth ----------------------------------------------------------------
     t:eq(code(nest(128)), "ok", "depth 128 passes")
     t:eq(code(nest(129)), "limit_depth", "depth 129 fails")
@@ -34,7 +35,7 @@ return function(t)
     t:eq(code('{"a":{"b":{"c":{}}}}', { max_depth = 3 }), "limit_depth", "object nesting counts")
     t:eq(code(nest(1024), { max_depth = 1024 }), "ok", "hard cap 1024 passes")
     t:eq(code("{}", { max_depth = 1025 }), "bad_args", "max_depth above hard cap")
-    local _, err, d = scan(nest(129))
+    local _, _, d = scan(nest(129))
     t:eq(d and d.offset, 5 + 127, "limit_depth offset at the 129th opener")
 
     local deep = '{"a":' .. string.rep("[", 100000) .. string.rep("]", 100000) .. "}"
@@ -42,7 +43,9 @@ return function(t)
     t:eq(code(deep), "limit_depth", "100000 levels fail fast")
     t:eq(code(deep, { max_depth = 1024 }), "limit_depth", "100000 levels with max_depth 1024")
     local dt = (U.now_ns() - t0) / 1e6
-    t:ok(dt < 1000, "100000 levels: two scans in " .. string.format("%.1f", dt) .. " ms")
+    if not light then
+        t:ok(dt < 1000, "100000 levels: two scans in " .. string.format("%.1f", dt) .. " ms")
+    end
     t:note({ case = "100000-level nesting", strict = code(deep), shallow = code(deep, { validate = "shallow" }) })
 
     -- scheme B (the module default): depth is only enforced on the levels it walks
@@ -100,13 +103,15 @@ return function(t)
     t:eq(code('{"model":"aaaa","model":"bbbb"}', { paths = { "model" }, max_extract_bytes = 8,
               allow_duplicates = true }), "limit_extract", "duplicates count toward the limit")
     t:eq(code("{}", { max_extract_bytes = 16 * 1024 * 1024 + 1 }), "bad_args", "max_extract above hard cap")
-    local huge = '{"model":"' .. string.rep("x", 50 * 1000 * 1000) .. '","stream":true}'
+    local huge_mb = light and 1 or 50
+    local huge = '{"model":"' .. string.rep("x", huge_mb * 1000 * 1000) .. '","stream":true}'
     local h_idx, h_err, h_d = scan(huge, { paths = { "model", "stream" } })
-    t:eq(h_err, "limit_extract", "50 MB model value -> limit_extract")
+    t:eq(h_err, "limit_extract", huge_mb .. " MB model value -> limit_extract")
     t:eq(h_d and h_d.offset, 9, "limit_extract offset at the value")
     t:ok(h_idx == nil, "no index on fatal limit")
-    t:eq(code(huge, { paths = { "stream" } }), "ok", "50 MB value not extracted passes")
-    huge = nil
+    t:eq(code(huge, { paths = { "stream" } }), "ok", huge_mb .. " MB value not extracted passes")
+    -- drop the reference so the 50 MB body can be collected
+    huge = nil  -- luacheck: ignore 311
 
     -- truncation: every proper prefix of a valid document is a syntax error -
     local doc = '{"model":"gpt","messages":[{"role":"user","content":"hi \\"x\\" \\u00e9"}],' ..
