@@ -15,6 +15,13 @@ static long PAGESIZE = 0;
 // on the original buffer directly as `padded_string_view`.
 // This is because reading within the boundary of a mapped memory page is guaranteed
 // not to fail, even if these area might contain garbage data, simdjson will work correctly.
+//
+// A copy is needed when the last padding byte (buf + len - 1 + SIMDJSON_PADDING) would
+// fall on a later page than the last input byte, i.e. when
+// offset_in_page(buf + len - 1) + SIMDJSON_PADDING >= PAGESIZE.
+// The earlier upstream example compared the offset with SIMDJSON_PADDING instead, which
+// skipped the copy exactly when the input ends in the last SIMDJSON_PADDING bytes of a
+// page. Fixed upstream in simdjson/simdjson#2271 (#2273, #2477).
 static bool need_allocation(const char *buf, size_t len) {
     if (PAGESIZE == 0) {
         PAGESIZE = getpagesize();
@@ -22,8 +29,8 @@ static bool need_allocation(const char *buf, size_t len) {
 
     SIMDJSON_DEVELOPMENT_ASSERT(PAGESIZE > 0);
 
-    return ((reinterpret_cast<uintptr_t>(buf + len - 1) % PAGESIZE) <
-            SIMDJSON_PADDING);
+    return ((reinterpret_cast<uintptr_t>(buf + len - 1) % PAGESIZE) +
+            SIMDJSON_PADDING >= static_cast<uintptr_t>(PAGESIZE));
 }
 
 
