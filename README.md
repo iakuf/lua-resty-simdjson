@@ -2,9 +2,36 @@
 
 The fastest way to decode JSON in OpenResty for latency sensitive applications.
 
+# Fork changes
+
+This is [iakuf/lua-resty-simdjson](https://github.com/iakuf/lua-resty-simdjson),
+a fork of [Kong/lua-resty-simdjson](https://github.com/Kong/lua-resty-simdjson).
+`main` is based on upstream **v1.3.0** (`37c830c`, simdjson 4.6.4) and adds the
+changes below. The decoder/encoder API is unchanged, and the shared library only
+gains new symbols, so existing callers keep working.
+
+| Date | Change | Commits |
+| --- | --- | --- |
+| 2026-10-12 | **Fix: zero-copy padding check.** `need_allocation()` decides whether the input can be parsed in place instead of being copied into a padded buffer. The check came from an old simdjson documentation example that compared the wrong end of the page, so input ending within the last 64 bytes of a memory page was parsed in place and simdjson could read into the next page (a crash if that page is not mapped). It now uses the corrected condition from [simdjson#2271](https://github.com/simdjson/simdjson/issues/2271). Parse results are unchanged. Regression test: `t/10-padding-boundary.t`. | `2722c49` |
+| 2026-07-03 | **New: gjson-style path extraction.** `resty.simdjson.gjson` (`get`, `get_many`) reads single fields from a large document without decoding all of it, built on four new FFI functions: `iterate`, `at_pointer`, `get_pointer` and `find_index`. See [Path-based extraction](#path-based-extraction-gjson-style). | `fb19c8d`, `f3900d1`, `38a740e`, `f8cf7d8` |
+
+Files changed from upstream: `src/simdjson_ffi.cpp`, `lib/resty/simdjson/cdefs.lua`
+and `README.md`. Files added: `lib/resty/simdjson/gjson.lua` and
+`t/10-padding-boundary.t`. The changes are under the same Apache-2.0 license as
+the original.
+
+**Not merged from upstream yet:** Kong commits after v1.3.0, among them simdjson
+4.6.11 and the decoder fixes for state left behind by a failed decode.
+Upstream still has the old padding check as of 2026-10-12.
+
+**Building:** compile on the same or an older glibc/libstdc++ than the runtime
+image. A library built on a newer distribution fails to load with an error like
+`GLIBCXX_3.4.32 not found`.
+
 # Table of Contents
 
 * [lua-resty-simdjson](#lua-resty-simdjson)
+* [Fork changes](#fork-changes)
 * [Synopsis](#synopsis)
 * [APIs](#apis)
     * [simdjson.new](#simdjsonnew)
