@@ -12,12 +12,15 @@ gains new symbols, so existing callers keep working.
 
 | Date | Change | Commits |
 | --- | --- | --- |
+| 2026-10-13 | **New: root-scan.** Index top-level JSON members and extract bounded fields in one stage-1 pass, from a Lua string or a read-only mapped file. Provides strict and shallow validation, offsets, limits and timing; the Lua default is shallow, so gateways requiring whole-document validation must explicitly select strict. See [Root scan](#root-scan). | `d6975af`, `d534c58`, `32cd2cd` |
 | 2026-10-12 | **Fix: zero-copy padding check.** `need_allocation()` decides whether the input can be parsed in place instead of being copied into a padded buffer. The check came from an old simdjson documentation example that compared the wrong end of the page, so input ending within the last 64 bytes of a memory page was parsed in place and simdjson could read into the next page (a crash if that page is not mapped). It now uses the corrected condition from [simdjson#2271](https://github.com/simdjson/simdjson/issues/2271). Parse results are unchanged. Regression test: `t/10-padding-boundary.t`. | `2722c49` |
 | 2026-07-03 | **New: gjson-style path extraction.** `resty.simdjson.gjson` (`get`, `get_many`) reads single fields from a large document without decoding all of it, built on four new FFI functions: `iterate`, `at_pointer`, `get_pointer` and `find_index`. See [Path-based extraction](#path-based-extraction-gjson-style). | `fb19c8d`, `f3900d1`, `38a740e`, `f8cf7d8` |
 
 Files changed from upstream: `src/simdjson_ffi.cpp`, `lib/resty/simdjson/cdefs.lua`
-and `README.md`. Files added: `lib/resty/simdjson/gjson.lua` and
-`t/10-padding-boundary.t`. The changes are under the same Apache-2.0 license as
+and `README.md`; root-scan also extends `src/simdjson_ffi.h`. Files added include
+`lib/resty/simdjson/gjson.lua`, `lib/resty/simdjson/root_scan.lua`,
+`t/10-padding-boundary.t`, `t/11-root-scan.t` and `t/root_scan/` specs.
+The changes are under the same Apache-2.0 license as
 the original.
 
 **Not merged from upstream yet:** Kong commits after v1.3.0, among them simdjson
@@ -47,6 +50,12 @@ image. A library built on a newer distribution fails to load with an error like
     * [gjson:get\_many](#gjsonget_many)
     * [Path syntax](#path-syntax)
     * [Low-level FFI primitives](#low-level-ffi-primitives)
+* [Root scan (top-level member index)](#root-scan-top-level-member-index)
+    * [root\_scan.scan\_string / scan\_file](#root_scanscan_string--scan_file)
+    * [Validation modes](#validation-modes)
+    * [Limits and error codes](#limits-and-error-codes)
+    * [C ABI](#c-abi)
+    * [Memory, timing and caveats](#memory-timing-and-caveats)
 * [Performance characteristics](#performance-characteristics)
     * [Speed & Latency](#speed--latency)
     * [Memory](#memory)
@@ -340,6 +349,194 @@ These are generic JSON primitives and carry no business logic. All values
 `json` buffer directly (zero-copy). Keep a Lua reference to `json` alive until
 all `at_pointer` / `find_index` calls for that document have completed. The
 `gjson` module already satisfies this within each `get`.
+
+[Back to TOC](#table-of-contents)
+
+# Root scan (top-level member index)
+
+`resty.simdjson.root_scan` indexes the top level of a JSON **object** body in
+one native call (one simdjson stage-1 pass), from a Lua string or straight from
+a file such as an Nginx request-body temp file. It returns every top-level
+member in document order with its decoded key and byte offsets, plus the raw
+bytes of a few requested fields. It is meant for proxies that need `model`,
+`stream`, session keys and the like without decoding a multi-megabyte body.
+
+```lua
+local rs = require("resty.simdjson.root_scan")   -- pcall it: fails on an older .so
+
+local idx, err, detail = rs.scan_file(ngx.req.get_body_file(), {
+    paths = { "model", "stream", "stream_options", "metadata.user_id" },
+})
+if not idx then
+    -- err: "syntax" | "root_not_object" | "trailing_content" | "duplicate_key" | "limit_*" | "io" | ...
+    return ngx.exit(400)
+end
+local model = idx.map.model                    -- decoded value, same shape as gjson:get_many
+local m = idx.members[1]                       -- { key, key_start, key_end, value_start, value_end, type, duplicate }
+```
+
+The module is stateless (no `new` / `destroy`): every call builds its own
+options and frees its own native result before returning. Nothing is shared
+between calls except a read-only page-size cache.
+
+[Back to TOC](#table-of-contents)
+
+## root\_scan.scan\_string / scan\_file
+
+**syntax:** *idx, err, detail = rs.scan_string(json, opts?)*
+
+**syntax:** *idx, err, detail = rs.scan_file(path, opts?)*
+
+`opts` (all optional):
+
+| key | meaning |
+| --- | --- |
+| `paths` | up to 16 dotted paths of 1 or 2 object keys (`"model"`, `"metadata.user_id"`). The second key only matches a direct child of the top-level object; deeper or in-array occurrences never match. No array indexes, predicates or wildcards (`bad_args`). |
+| `validate` | `"shallow"` (default, scheme B) or `"strict"` (scheme A), see [Validation modes](#validation-modes) |
+| `allow_duplicates` | `false` (default): a repeated top-level key, or a repeated key under a requested parent, returns `nil, "duplicate_key", detail` with the full index in `detail.index`. `true`: return the index with `has_duplicates = true`. |
+| `decode_values` | `true` (default): decode each hit with a private `cjson.safe` instance into `values[p].value` and `map[p]`. `false`: raw bytes only, `map` is `nil`. |
+| `max_depth`, `max_members`, `max_key_bytes`, `max_extract_bytes` | see [Limits](#limits-and-error-codes); `0`/absent = default |
+
+`idx`:
+
+| field | meaning |
+| --- | --- |
+| `members[i]` | `key` (decoded: `"mo\u0064el"` is `"model"`), `key_start`/`key_end` (include the quotes), `value_start`/`value_end`, `type` (`object array string number boolean null`), `duplicate` (set on **every** occurrence of a repeated key). Offsets are 0-based bytes, ranges `[start, end)`, so `json:sub(start + 1, end)` is the text. |
+| `values[path]` | only for hits: `raw` (exact JSON text), `value`, `type`, `value_start`, `value_end`, `duplicate`. On repeats the last occurrence wins (lua-cjson semantics); a repeated parent object replaces the earlier one for its second-level paths. |
+| `map[path]` | decoded hits, `{ path = value }` like `gjson:get_many`; JSON `null` is `cjson.null` (`== ngx.null`) |
+| `mode`, `input_len`, `copied_bytes`, `root_start`, `root_end`, `max_depth_seen`, `has_duplicates` | input facts; `copied_bytes > 0` only when a string had to be copied for padding |
+| `timing` | `input_ns`, `index_ns` (stage 1), `walk_ns`, `total_ns` (the whole blocking C call) |
+
+`detail` on error: `status`, `message` (static text, never input bytes or the
+path), `offset` (byte offset when known), `errno` (I/O), `index` (duplicates).
+
+Not the same as `gjson:get_many` in two documented ways: keys are compared
+after unescaping (get_many compares raw key bytes, so it misses
+`"mo\u0064el"`), and repeated keys are reported (get_many returns the first
+occurrence, lua-cjson the last).
+
+[Back to TOC](#table-of-contents)
+
+## Validation modes
+
+Both modes run simdjson stage 1 on the whole input, which rejects invalid
+UTF-8, raw control characters in strings and unclosed strings, and both
+validate the top level strictly: the object structure, every key (escapes,
+length), every top-level scalar, and the direct children of a requested
+parent (`metadata` for `metadata.user_id`).
+
+* **`"strict"` (scheme A)** walks every nested value with the On-Demand
+  iterator (missing commas/colons, trailing commas, non-string keys, bracket
+  mismatches) and checks every string's escapes on the raw bytes (`\uXXXX`,
+  surrogate pairs, same rules as lua-cjson), every number against the RFC 8259
+  grammar (no conversion: `1e400` and 30-digit integers pass, as in lua-cjson)
+  and `true/false/null` with simdjson. Nothing is unescaped or written to the
+  parser's string buffer. Fuzzed against lua-cjson: whatever strict accepts,
+  lua-cjson accepts with identical keys, offsets and values.
+* **`"shallow"` (scheme B, default)** skips nested containers by bracket
+  counting. **Residual risk:** inside nested containers it accepts missing or
+  extra commas/colons, non-string keys, invalid numbers and literals, invalid
+  escapes and lone surrogates, mismatched bracket types (`[1}`) and any depth.
+  A body like that is forwarded and the upstream decides (an upstream 4xx
+  instead of a local 400; a lenient upstream may accept non-standard JSON).
+  The top-level fields read by the caller are still exact, because string
+  boundaries and UTF-8 come from stage 1 and the top level is strict.
+
+The default was chosen by measurement: strict costs 1.9-2.8x shallow on 8-50 MB
+escape-dense bodies, above the 2.0x budget in 10 of 12 cells over two runs.
+`validate = "strict"` is a per-call switch.
+
+[Back to TOC](#table-of-contents)
+
+## Limits and error codes
+
+| option | default | hard cap | error |
+| --- | ---: | ---: | --- |
+| `max_depth` (root object = 1; 128 passes, 129 fails; shallow enforces it only on the levels it walks) | 128 | 1024 | `limit_depth` |
+| `max_members` (top-level members) | 256 | 65536 | `limit_members` |
+| `max_key_bytes` (each top-level key, decoded) | 1024 | 65536 | `limit_key` |
+| `max_extract_bytes` (sum of all hits, repeats included; never truncated) | 65536 | 16 MiB | `limit_extract` |
+| input length | | 4294967295 | `limit_input` |
+
+Above a hard cap, or bad paths/types: `bad_args`. Stage 1 runs over the whole
+input before the walk, so a stage-1 error (invalid UTF-8, a raw control
+character or an unclosed string, wherever it is) is reported first; otherwise
+the walk stops at the first error in document order, limits included (a limit
+fails at the point it is reached).
+
+| err | C status | when |
+| --- | ---: | --- |
+| (ok) / `duplicate_key` | 0 / 1 | duplicates are non-fatal: the index is complete |
+| `syntax` | -10 | empty or whitespace-only input, UTF-8 BOM, malformed JSON |
+| `root_not_object` | -11 | first byte is one of `[ " - 0-9 t f n` |
+| `trailing_content` | -12 | anything but whitespace after the root object (if the trailing bytes themselves break stage 1, e.g. an unclosed string, the result can be `syntax`) |
+| `limit_*` | -20..-24 | see above |
+| `io` | -30 | open/fstat/mmap failure, not a regular file (`detail.errno`) |
+| `nomem`, `bad_args`, `internal` | -40, -41, -42 | |
+
+[Back to TOC](#table-of-contents)
+
+## C ABI
+
+Declared at the end of `src/simdjson_ffi.h` (additive; the existing functions
+and `simdjson_ffi_op_t` are unchanged) and re-declared by `root_scan.lua`:
+
+```c
+uint32_t simdjson_ffi_root_scan_abi(uint32_t *sizes, uint32_t n);   /* 1; sizes of the 5 structs */
+int  simdjson_ffi_root_scan_string(const char *buf, size_t len,
+         const simdjson_ffi_rs_options_t *opts, simdjson_ffi_rs_result_t **out);
+int  simdjson_ffi_root_scan_file(const char *path, size_t path_len,
+         const simdjson_ffi_rs_options_t *opts, simdjson_ffi_rs_result_t **out);
+void simdjson_ffi_root_scan_free(simdjson_ffi_rs_result_t *res);    /* NULL-safe */
+```
+
+Struct sizes are fixed by `static_assert` (path 32, options 32, member 48,
+value 32, result 144 bytes) and checked against `ffi.sizeof` when the Lua
+module loads. `*out` is NULL only when `out` is NULL or the result itself
+could not be allocated; otherwise the caller frees it, also on errors. At the C
+level `flags = 0` means strict (`SIMDJSON_FFI_RS_F_SHALLOW` selects shallow);
+the Lua default is shallow.
+
+[Back to TOC](#table-of-contents)
+
+## Memory, timing and caveats
+
+* **Lua heap** does not grow with the body: about 10 KiB per scan for 1 MB and
+  50 MB bodies alike (the result tables). In file mode the body never enters Lua.
+* **C memory** is per call and released before return: the parser reserves
+  about 5.7x the input as *virtual* memory, but only the structural index is
+  touched (4 bytes per structural character). Measured peak above the
+  pre-call RSS: 0 KiB for a 50 MB base64 image body, ~14 MiB for 50 MB of chat
+  messages, ~190 MiB for 50 MB of `[0,0,0,...]` (the same as `gjson:get_many`).
+  File mode additionally maps the page-cache pages of the body (RssFile).
+* **String input** is used in place when the 64 bytes after its end lie in the
+  same page; otherwise it is copied once with padding (`copied_bytes`). This
+  is the same `get_padded_string_view()` decision the existing `parse`,
+  `iterate` and `get_pointer` use.
+  **File input** is never copied: a `PROT_READ` anonymous reservation of
+  `roundup(size + 64, page)` bytes with the file mapped over its start
+  (`MAP_FIXED`), so the padding always reads as zeros.
+* **SIGBUS:** truncating the file while it is being scanned faults the worker.
+  Only pass files nobody else writes (Nginx's own request-body temp files).
+* **Blocking:** one FFI call, it cannot yield. Measured on an i5-12490F,
+  release build, `apache/apisix:3.15.0-debian` (`timing.total_ns` for root
+  scan, wall clock for the others; median of 5 samples, range over two runs):
+
+  | 50 MB body | shallow (default) | strict | `gjson:get_many` (3 fields) | `cjson.safe.decode` |
+  | --- | ---: | ---: | ---: | ---: |
+  | base64 image | 4.7-5.5 ms | 8.7-11 ms | 14-16 ms | 98-101 ms |
+  | chat messages | 17.5-18.5 ms | 27-28 ms | 24 ms | 283-292 ms |
+  | escape-dense text | 10-11 ms | 28-29 ms | 20-21 ms | 98 ms |
+  | `[0,0,...]` | 126-151 ms | 255-261 ms | 164-169 ms | 528-545 ms |
+
+  Scaling is linear; budget concurrency for the worst shape.
+* **Padding check:** `need_allocation()` copies when the input's last byte
+  plus `SIMDJSON_PADDING` would reach the next page (the simdjson
+  free-padding rule). Earlier versions compared the page offset with
+  `SIMDJSON_PADDING` the other way round and could read past an input that
+  ends near the end of a page; `t/10-padding-boundary.t` covers that case for
+  `iterate` / `get_pointer` / `parse`, and the root-scan specs place string
+  inputs 0..80 bytes before a guard page.
 
 [Back to TOC](#table-of-contents)
 
